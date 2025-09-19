@@ -1,0 +1,21 @@
+name: Jail Airtable Sync
+
+on:
+  schedule:
+    - cron: '0 * * * *' # every hour
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    env:
+      AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+      - name: Run script
+        run: python jail_rss_generator.py
