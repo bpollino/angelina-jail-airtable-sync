@@ -1,8 +1,9 @@
 name: Jail Airtable Sync
 
 on:
+  workflow_dispatch:       # Allows manual triggering
   schedule:
-    - cron: '0 * * * *' # every hour
+    - cron: '0 * * * *'    # Runs every hour
 
 jobs:
   run-script:
