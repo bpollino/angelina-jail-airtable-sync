@@ -7,12 +7,86 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import re
 import os
+import csv
 
 # Configuration
 JAIL_URL = "https://www.angelinacounty.net/injail/"
+AIRTABLE_API_KEY = os.getenv('AIRTABLE_API_KEY')  # Load from environment variable
+AIRTABLE_BASE_ID = 'appBn4Xs7GdnheynS'
+AIRTABLE_TABLE_NAME = 'tblq3cgwhhPPjffEi'  # Use the table ID, not the display name
+
+def extract_race_ethnicity_age(demographics):
+    age = ''
+    race = ''
+    ethnicity = ''
+    info = demographics.get('age', '')
+    for line in info.split('\n'):
+        line = line.strip()
+        if line.startswith('Age:'):
+            age = line.replace('Age:', '').strip()
+        elif line.startswith('Race:'):
+            race = line.replace('Race:', '').strip()
+        elif line.startswith('Ethnicity:'):
+            ethnicity = line.replace('Ethnicity:', '').strip()
+        elif line and not race and not ethnicity and not age:
+            age = line
+    age = ''.join(filter(str.isdigit, age))
+    return race, ethnicity, age
+
+def get_existing_jailids_from_airtable():
+    url = f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}'
+    headers = {
+        'Authorization': f'Bearer {AIRTABLE_API_KEY}',
+    }
+    jailids = set()
+    offset = None
+    while True:
+        params = {}
+        if offset:
+            params['offset'] = offset
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            for record in data.get('records', []):
+                jailid = record['fields'].get('JailID')
+                if jailid:
+                    jailids.add(str(jailid))
+            offset = data.get('offset')
+            if not offset:
+                break
+        else:
+            print("Error fetching Airtable records:", response.text)
+            break
+    return jailids
+
+def get_all_airtable_jailid_records():
+    url = f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}'
+    headers = {
+        'Authorization': f'Bearer {AIRTABLE_API_KEY}',
+    }
+    jailid_to_record = {}
+    offset = None
+    while True:
+        params = {}
+        if offset:
+            params['offset'] = offset
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            for record in data.get('records', []):
+                jailid = record['fields'].get('JailID')
+                released = record['fields'].get('Released')
+                if jailid:
+                    jailid_to_record[str(jailid)] = {'id': record['id'], 'Released': released}
+            offset = data.get('offset')
+            if not offset:
+                break
+        else:
+            print("Error fetching Airtable records:", response.text)
+            break
+    return jailid_to_record
 
 def get_jail_table():
-    """Scrape the jail roster and return inmate data with detail page info"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
@@ -36,7 +110,7 @@ def get_jail_table():
             if not all(header in headers_list for header in expected_headers):
                 continue
 
-            rows = table.find_all('tr')[1:]  # Skip header row
+            rows = table.find_all('tr')[1:]
             inmates = []
             for row in rows:
                 cells = [td.get_text(strip=True) for td in row.find_all(['td', 'th'])]
@@ -50,13 +124,11 @@ def get_jail_table():
                     eye_color = cells[4].strip()
                     hair_color = cells[5].strip()
                     booking_date = cells[6].strip()
-                    # Extract jailid from onclick attribute of <tr>
                     jailid = None
                     onclick_attr = row.get('onclick', '')
                     jailid_match = re.search(r'jailid=(\d{6})', onclick_attr)
                     if jailid_match:
                         jailid = jailid_match.group(1)
-                    # Construct detail link using jailid
                     detail_link = None
                     if jailid:
                         detail_link = f'https://www.angelinacounty.net/injail/inmate/?jailid={jailid}'
@@ -67,18 +139,16 @@ def get_jail_table():
                             booking_datetime = datetime.strptime(booking_date, '%m/%d/%Y')
                         except ValueError:
                             continue
-                        # Scrape detail page if available
                         mugshot_url = None
                         aliases = []
                         tattoos = []
-                        demographics = None
+                        demographics = {}
                         offenses = []
                         if detail_link:
                             try:
                                 detail_resp = requests.get(detail_link, headers=headers, timeout=20)
                                 detail_resp.raise_for_status()
                                 detail_soup = BeautifulSoup(detail_resp.content, 'html.parser')
-                                # Mugshots
                                 mugshot_url = None
                                 inmate_image_div = detail_soup.find('div', class_='inmate-image')
                                 if inmate_image_div:
@@ -87,9 +157,6 @@ def get_jail_table():
                                         mugshot_url = img_tag['src']
                                         if not mugshot_url.startswith('http'):
                                             mugshot_url = 'https://www.angelinacounty.net' + mugshot_url
-                                print(f"Mugshot URL for {name}: {mugshot_url}")
-                                # Demographics
-                                demographics = {}
                                 details_div = detail_soup.find('div', class_='inmate-details')
                                 if details_div:
                                     p_tag = details_div.find('p')
@@ -99,13 +166,10 @@ def get_jail_table():
                                             if ':' in line:
                                                 k, v = line.split(':', 1)
                                                 demographics[k.strip().lower().replace(' ', '_')] = v.strip()
-                                print(f"Demographics for {name}: {demographics}")
-                                # Offenses
-                                offenses = []
                                 offense_table = detail_soup.find('table', class_='table-mobile-full')
                                 if offense_table:
                                     rows = offense_table.find_all('tr')
-                                    for tr in rows[1:]:  # skip header
+                                    for tr in rows[1:]:
                                         tds = tr.find_all('td')
                                         if len(tds) == 5:
                                             offense = {
@@ -116,19 +180,13 @@ def get_jail_table():
                                                 'agency': tds[4].get_text(strip=True)
                                             }
                                             offenses.append(offense)
-                                print(f"Offenses for {name}: {offenses}")
-                                # Aliases
-                                aliases = []
-                                alias_box = detail_soup.find('div', class_='box-content', text=None)
+                                alias_box = detail_soup.find('div', class_='box-content', string=None)
                                 if alias_box:
                                     alias_title = alias_box.find('h6', string=re.compile('Known Aliases'))
                                     if alias_title:
                                         ul = alias_box.find('ul')
                                         if ul:
                                             aliases = [li.get_text(strip=True) for li in ul.find_all('li')]
-                                print(f"Aliases for {name}: {aliases}")
-                                # Tattoos/Scars/Marks
-                                tattoos = []
                                 tattoo_box = None
                                 for box in detail_soup.find_all('div', class_='box-content'):
                                     title = box.find('h6')
@@ -139,14 +197,8 @@ def get_jail_table():
                                     ul = tattoo_box.find('ul')
                                     if ul:
                                         tattoos = [li.get_text(strip=True) for li in ul.find_all('li')]
-                                print(f"Tattoos for {name}: {tattoos}")
                             except Exception as e:
                                 print(f"Error scraping detail page for {name}: {e}")
-                        print(f"\n--- Detail for {name} ---")
-                        print(f"Aliases: {aliases}")
-                        print(f"Tattoos: {tattoos}")
-                        print(f"Demographics: {demographics}")
-                        print(f"Offenses: {offenses}")
                         inmate = {
                             'name': name,
                             'sex': sex,
@@ -161,7 +213,8 @@ def get_jail_table():
                             'aliases': aliases,
                             'tattoos': tattoos,
                             'demographics': demographics,
-                            'offenses': offenses
+                            'offenses': offenses,
+                            'jailid': jailid
                         }
                         inmates.append(inmate)
                 except Exception as e:
@@ -178,79 +231,92 @@ def get_jail_table():
         print(f"Error parsing jail data: {e}")
         return []
 
-def generate_rss(inmates):
-    """Generate RSS feed from inmate data with detail info"""
-    if not inmates:
-        print("No inmates to include in RSS feed")
-        return None
-    rss = ET.Element('rss', version='2.0')
-    channel = ET.SubElement(rss, 'channel')
-    ET.SubElement(channel, 'title').text = 'Angelina County Jail Roster'
-    ET.SubElement(channel, 'link').text = JAIL_URL
-    ET.SubElement(channel, 'description').text = 'Recent bookings at Angelina County Jail'
-    ET.SubElement(channel, 'language').text = 'en-us'
-    ET.SubElement(channel, 'lastBuildDate').text = datetime.now().strftime('%a, %d %b %Y %H:%M:%S +0000')
-    for inmate in inmates[:50]:
-        item = ET.SubElement(channel, 'item')
-        title = f"{inmate['name']} - {inmate['booking_date']}"
-        ET.SubElement(item, 'title').text = title
-        ET.SubElement(item, 'link').text = inmate.get('detail_link', JAIL_URL)
-        desc_lines = [
-            f"<b>Name:</b> {inmate['name']}",
-            f"<b>Sex:</b> {inmate['sex']}",
-            f"<b>Height:</b> {inmate['height']}",
-            f"<b>Weight:</b> {inmate['weight']}",
-            f"<b>Eye Color:</b> {inmate['eye_color']}",
-            f"<b>Hair Color:</b> {inmate['hair_color']}",
-            f"<b>Booking Date:</b> {inmate['booking_date']}"
-        ]
-        if inmate.get('mugshot_url'):
-            desc_lines.append(f'<img src="{inmate["mugshot_url"]}" alt="Mugshot" width="150"/>')
-        else:
-            desc_lines.append('<i>No mugshot available</i>')
-        if inmate.get('aliases'):
-            desc_lines.append('<b>Known Aliases:</b> ' + ', '.join(inmate['aliases']))
-        if inmate.get('tattoos'):
-            desc_lines.append('<b>Scars/Marks/Tattoos:</b> ' + ', '.join(inmate['tattoos']))
-        demo = inmate.get('demographics')
-        if isinstance(demo, dict) and demo:
-            demo_str = ', '.join([f'{k.capitalize()}: {v}' for k, v in demo.items()])
-            desc_lines.append('<b>Demographics:</b> ' + demo_str)
-        if inmate.get('offenses'):
-            desc_lines.append('<b>Offenses:</b><ul>')
-            for off in inmate['offenses']:
-                desc_lines.append(f'<li>{off["charge"]} ({off["degree"]}) - Bond: {off["bond"]}, Hold: {off["hold_reason"]}, Agency: {off["agency"]}</li>')
-            desc_lines.append('</ul>')
-        description = '<br/>'.join(desc_lines)
-        ET.SubElement(item, 'description').text = description.strip()
-        pub_datetime = inmate['booking_datetime'].replace(hour=12, minute=0, second=0)
-        pub_date = pub_datetime.strftime('%a, %d %b %Y %H:%M:%S +0000')
-        ET.SubElement(item, 'pubDate').text = pub_date
-        guid = f"angelina-jail-{inmate['name'].replace(' ', '-').replace(',', '')}-{inmate['booking_date'].replace('/', '-')}"
-        ET.SubElement(item, 'guid', isPermaLink='false').text = guid
-    return rss
+def create_airtable_record(inmate):
+    url = f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}'
+    headers = {
+        'Authorization': f'Bearer {AIRTABLE_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    demographics = inmate.get('demographics') or {}
+    race, ethnicity, age = extract_race_ethnicity_age(demographics)
+    offenses = inmate.get('offenses', [])
+    offense_list = [off.get('charge', '') for off in offenses]
+    degree_list = [off.get('degree', '') for off in offenses]
+    bond_list = [off.get('bond', '') for off in offenses]
+    hold_list = [off.get('hold_reason', '') for off in offenses]
+    agency_list = list({off.get('agency', '') for off in offenses if off.get('agency', '')})
+    data = {
+        "fields": {
+            'JailID': str(inmate.get('jailid', '')),
+            'Name': inmate.get('name', ''),
+            'Sex': inmate.get('sex', ''),
+            'Race': race,
+            'Ethnicity': ethnicity,
+            'Height': inmate.get('height', ''),
+            'Weight': inmate.get('weight', ''),
+            'Eye Color': inmate.get('eye_color', ''),
+            'Hair Color': inmate.get('hair_color', ''),
+            'Booking Date': inmate.get('booking_date', ''),
+            'Detail Link': inmate.get('detail_link', ''),
+            'Mugshot URL': inmate.get('mugshot_url', ''),
+            'Known Aliases': ', '.join(inmate.get('aliases', [])),
+            'Scars/Marks/Tattoos': ', '.join(inmate.get('tattoos', [])),
+            'Age': age,
+            'Offenses': '; '.join(offense_list),
+            'Degrees': '; '.join(degree_list),
+            'Bond Amounts': '; '.join(bond_list),
+            'Hold Reasons': '; '.join(hold_list),
+            'Arresting Agencies': '; '.join(agency_list)
+        }
+    }
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code == 200 or response.status_code == 201:
+        print(f"Added inmate {inmate.get('name', '')} (JailID: {inmate.get('jailid', '')}) to Airtable.")
+    else:
+        print(f"Error adding inmate {inmate.get('name', '')}: {response.text}")
+
+def update_released_in_airtable(missing_jailids, jailid_to_record):
+    url = f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}'
+    headers = {
+        'Authorization': f'Bearer {AIRTABLE_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    released_date = datetime.now().strftime('%Y-%m-%d')
+    for jailid in missing_jailids:
+        record_info = jailid_to_record.get(jailid)
+        if record_info and not record_info.get('Released'):
+            record_id = record_info['id']
+            patch_url = f"{url}/{record_id}"
+            data = {
+                "fields": {
+                    "Released": released_date
+                }
+            }
+            patch_resp = requests.patch(patch_url, headers=headers, json=data)
+            if patch_resp.status_code == 200:
+                print(f"Marked JailID {jailid} as released on {released_date}")
+            else:
+                print(f"Error updating release for JailID {jailid}: {patch_resp.text}")
 
 def main():
-    print("Starting RSS generation...")
+    print("Starting Airtable sync...")
     inmates = get_jail_table()
     if inmates:
         print(f"Successfully found {len(inmates)} inmates")
-        rss_feed = generate_rss(inmates)
-        if rss_feed:
-            rough_string = ET.tostring(rss_feed, 'unicode')
-            reparsed = minidom.parseString(rough_string)
-            pretty_xml = reparsed.toprettyxml(indent="  ")
-            pretty_xml = '\n'.join([line for line in pretty_xml.split('\n') if line.strip()])
-            output_path = os.path.join('docs', 'angelina_jail_feed.xml')
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(pretty_xml)
-            print("RSS feed generated successfully!")
-            print(f"Feed contains {len(inmates[:50])} recent bookings")
-        else:
-            print("Failed to generate RSS feed.")
-            return False
+        jailid_to_record = get_all_airtable_jailid_records()
+        existing_jailids = set(jailid_to_record.keys())
+        current_jailids = set(str(inmate.get('jailid')) for inmate in inmates if inmate.get('jailid'))
+        new_inmates = [inmate for inmate in inmates if str(inmate.get('jailid')) not in existing_jailids]
+        print(f"Found {len(new_inmates)} new inmates not in Airtable")
+        for inmate in new_inmates:
+            create_airtable_record(inmate)
+        missing_jailids = existing_jailids - current_jailids
+        print(f"Found {len(missing_jailids)} released inmates to update")
+        update_released_in_airtable(missing_jailids, jailid_to_record)
+        if not new_inmates:
+            print("No new inmates to add to Airtable.")
     else:
-        print("No inmate data found - RSS feed not generated")
+        print("No inmate data found - nothing added to Airtable")
         return False
     return True
 
